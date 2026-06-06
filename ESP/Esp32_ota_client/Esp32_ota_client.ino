@@ -6,7 +6,7 @@
 const char* wifi_ssid = "FTTH";
 const char* wifi_pass = "12345678";
 
-const char* server_url = "https://grha-iot-backend-test.onrender.com";
+const char* server_url = "https://examples-0sgv.onrender.com";
 
 const char* device_id = "myesp32";
 const char* current_version = "1.0.0";

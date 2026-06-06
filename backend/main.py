@@ -163,7 +163,7 @@ def list_firmwares():
 
 @app.get("/")
 def root():
-    return {"message": "IoT OTA Update Server is Running", "catalog": firmware_catalog.keys()}
+    return {"message": "IoT OTA Update Server is Running", "catalog": list(firmware_catalog.keys())}
 
 
 @app.post("/firmware/checkin")
