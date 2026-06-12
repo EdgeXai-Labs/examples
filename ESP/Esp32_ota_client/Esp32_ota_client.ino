@@ -2,6 +2,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_ota_ops.h>
+#include "mbedtls/sha256.h"
+
 
 const char* wifi_ssid = "FTTH";
 const char* wifi_pass = "12345678";
@@ -9,12 +12,15 @@ const char* wifi_pass = "12345678";
 const char* server_url = "https://examples-0sgv.onrender.com";
 
 const char* device_id = "myesp32";
-const char* current_version = "1.0.0";
+const char* current_version = "0.0.0";
 
 #define LED_PIN 2
+#define OTA_BUFFER_SIZE 4096
 
 HTTPClient http;
 String pendingFirmwareId = "";
+String pendingFirmwareSHA = "";
+int pendingFirmwareSize = 0;
 
 void blinkLED(int times, int delayMs){
     for (int i =0; i< times; i++){
@@ -42,7 +48,7 @@ void connectwifi(){
     }
 }
 
-bool performChecking(){
+bool performCheckin(){
     Serial.println("\n[OTA] --- step 1 device checkin");
     
     String myurl = String(server_url) +"/firmware/checkin";
@@ -60,23 +66,16 @@ bool performChecking(){
     String reqBody;
     serializeJson(doc, reqBody);
 
-    Serial.printf("[HTTP] POST %s\n", myurl.c_str());
-    Serial.printf("[HTTP] Body: %s\n", reqBody.c_str());
-
-    int statusCode = http.POST(reqBody);
-    Serial.printf("[HTTP] Response: %d\n", statusCode);
-
-    if (statusCode != 200) {
-        Serial.printf("[OTA] Check-in failed: HTTP %d\n", statusCode);
+    int code = http.POST(reqBody);
+    if(code != 200){
+        Serial.printf("[OTA] Check-in failed: HTTP %d\n", code);
         http.end();
         return false;
     }
-
     String respBody = http.getString();
     Serial.printf("[HTTP] Body: %s\n", respBody.c_str());
     http.end();
 
-    // Parse response
     StaticJsonDocument<512> resDoc;
     DeserializationError err = deserializeJson(resDoc, respBody);
     if (err) {
@@ -94,14 +93,69 @@ bool performChecking(){
     }
 
     pendingFirmwareId = resDoc["firmware_id"].as<String>();
+    pendingFirmwareSHA = resDoc["sha256"].as<String>();
+    pendingFirmwareSize = resDoc["size_bytes"].as<int>();
+    
+    Serial.printf("[OTA] Update available! Firmware ID: %s\n", pendingFirmwareId.c_str());
+    return true;
+
+//     Serial.printf("[HTTP] POST %s\n", myurl.c_str());
+//     Serial.printf("[HTTP] Body: %s\n", reqBody.c_str());
+
+//     int statusCode = http.POST(reqBody);
+//     Serial.printf("[HTTP] Response: %d\n", statusCode);
+
+//     if (statusCode != 200) {
+//         Serial.printf("[OTA] Check-in failed: HTTP %d\n", statusCode);
+//         http.end();
+//         return false;
+//     }
+
+//     String respBody = http.getString();
+//     Serial.printf("[HTTP] Body: %s\n", respBody.c_str());
+//     http.end();
+
+//     // Parse response
+//     StaticJsonDocument<512> resDoc;
+//     DeserializationError err = deserializeJson(resDoc, respBody);
+//     if (err) {
+//         Serial.println("[OTA] JSON parse error");
+//         return false;
+//     }
+
+//     bool updateAvailable = resDoc["update_available"];
+//     const char* message  = resDoc["message"];
+//     Serial.printf("[OTA] Server says: %s\n", message);
+
+//     if (!updateAvailable) {
+//         Serial.println("[OTA] Device is up to date. No action needed.");
+//         return false;
+//     }
+
+//     pendingFirmwareId = resDoc["firmware_id"].as<String>();
     Serial.printf("[OTA] Update available! Firmware ID: %s\n", pendingFirmwareId.c_str());
     return true;
 }
 
-bool downlaod_the_firmware(){
-    Serial.println("\n[ota] step 2 - downloading firmware ");
+
+String bytesToHex(const uint8_t* bytes, size_t len) {
+    String result = "";
+    result.reserve(len * 2);            // pre-allocate: avoids String reallocation
+    char buf[3];
+    for (size_t i = 0; i < len; i++) {
+        snprintf(buf, sizeof(buf), "%02x", bytes[i]);
+        result += buf;
+    }
+    return result;
+}
+
+bool download_and_flash_firmware(){
+    Serial.println("\n[OTA] --- Step 2: Download & Flash Firmware");
     String url = String(server_url) + "/firmware/" + pendingFirmwareId;
     
+    const char* headerKeys[] = {"X-Firmware-Version", "X-Firmware-Size", "X-Firmware-SHA256"};
+    http.collectHeaders(headerKeys, 3);
+
     http.begin(url);
     http.addHeader("X-Device-ID", device_id);
     Serial.printf("[HTTP] GET %s\n", url.c_str());
@@ -113,33 +167,52 @@ bool downlaod_the_firmware(){
         return false;
     }
 
-    String firmwareCode = http.getString();
+    // String firmwareCode = http.getString();
      // Read response headers (metadata about the firmware)
-    String fwVersion  = http.header("X-Firmware-Version");
-    String fwSize     = http.header("X-Firmware-Size");
-    String fwChecksum = http.header("X-Firmware-Checksum");
 
-    Serial.println("[OTA] ── Firmware Metadata ──");
-    Serial.printf("  Version:  %s\n", fwVersion.c_str());
-    Serial.printf("  Size:     %s bytes\n", fwSize.c_str());
-    Serial.printf("  Checksum: %s\n", fwChecksum.c_str());
+    String headerSHA  = http.header("X-Firmware-SHA256");
+    String headerSize = http.header("X-Firmware-Size");
+    int    totalBytes = http.getSize();
 
-    // Read the firmware payload
-    // In real OTA: stream this into esp_ota_write() calls
-    // Here: print to Serial to show what arrived
-    int receivedBytes   = firmwareCode.length();
-    http.end();
+    Serial.println("[OTA] ── Response Headers ──");
+    Serial.printf("  SHA256:  %s\n", headerSHA.c_str());
+    Serial.printf("  Size:    %s bytes\n", headerSize.c_str());
+    Serial.printf("  Content-Length: %d\n", totalBytes);
 
-    Serial.println("\n[OTA] ── Received Firmware Code ──");
-    Serial.println("─────────────────────────────────────");
-    Serial.println(firmwareCode);
-    Serial.println("─────────────────────────────────────");
+    if (totalBytes <= 0){
+        Serial.println("[OTA] Error: Server did not send Content-Length");
+        http.end();
+        return false;
+    }
 
+    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
+
+    if (update_partition == NULL){
+        Serial.println("[OTA] Error: Could not find update partition");  /// You need: Tools > Partition Scheme > "Minimal SPIFFS (1.9MB APP with OTA)"
+        http.end();
+        return false;
+    }
+
+    Serial.printf("[OTA] Update partition: %s\n", update_partition->label);
+    Serial.printf("[OTA] Update partition address: %d\n", update_partition->address);
+    Serial.printf("[OTA] Update partition size: %d\n", update_partition->size);
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        Serial.printf("[OTA] Error: Failed to begin OTA update: %d\n", err);
+        http.end();
+        return false;
+    }
+    Serial.println("[OTA] Partition earesed for writingfirmware OTA handle opened....");
+   
+   
+   
     // Simulate flash write delay
-    Serial.printf("[OTA] Simulating flash write (%d bytes)...\n", receivedBytes);
-    for (int i = 0; i <= 100; i += 20) {
-        Serial.printf("[OTA] Writing... %d%%\n", i);
-        delay(300);
+    // Serial.printf("[OTA] Simulating flash write (%d bytes)...\n", receivedBytes);
+    // for (int i = 0; i <= 100; i += 20) {
+    //     Serial.printf("[OTA] Writing... %d%%\n", i);
+    //     delay(300);
     }
 
     // In real OTA you would call:
@@ -150,98 +223,209 @@ bool downlaod_the_firmware(){
     //   esp_ota_set_boot_partition(update_partition);
     //   esp_restart();
 
-    Serial.println("[OTA] Flash write complete (simulated)");
+    // Serial.println("[OTA] Flash write complete (simulated)");
+    // return true;
+
+    mbedtls_sha256_context sha_ctx;
+    mbedtls_sha256_init(&sha_ctx);
+    mbedtls_sha256_starts_ret(&sha_ctx, 0);
+
+    uint8_t buffer[OTA_BUFFER_SIZE];
+    int bytesReceived = 0;
+    int bytesRead = 0;
+    bool streamError = false;
+    // int bytesRead = 0;
+    
+    // Update context with each chunk
+    // for (int i = 0; i < totalBytes; i += chunkSize) {
+    //     int chunkLen = (i + chunkSize > totalBytes) ? (totalBytes - i) : chunkSize;
+    //     mbedtls_sha256_update(&ctx, (const unsigned char*)firmwareBuffer + i, chunkLen);
+    // }
+
+    // // Finalize and get hash
+    // uint8_t hash[32];
+    // mbedtls_sha256_finish(&ctx, hash);
+    // mbedtls_sha256_free(&ctx);
+
+    // // Convert to hex string
+//     String calculatedSHA = bytesToHex(hash, sizeof(hash));
+
+//     // Compare with expected SHA from server
+//     if (calculatedSHA.equalsIgnoreCase(pendingFirmwareSHA)) {
+//         Serial.println("[OTA] Hash verification SUCCESS! The firmware is authentic.");
+//         return true;
+//     } else {
+//         Serial.println("[OTA] Hash verification FAILED! Possible corruption or tampering.");
+//         return false;
+//     }
+// }
+  
+    WiFiClient* stream = http.getStreamPtr();
+  
+    Serial.println("[OTA] Starting to write firmware chunk by chunk...");
+    Serial.println("--------------------------------------------------");
+    Serial.printf("[OTA] Streaming firmware... (buffer=%d bytes)\n", OTA_BUFFER_SIZE);
+
+    while (bytesReceived < totalBytes){
+        int remainingBytes = totalBytes - bytesReceived;
+        int toRead = min(remainingBytes, OTA_BUFFER_SIZE);
+
+        int waited = 0;
+        while (stream->available() < toRead && waited < 5000){
+            delay(1);
+            waited++;
+        }
+        bytesRead = stream->readBytes(buffer, toRead);
+        if (bytesRead <= 0){
+            Serial.println("[OTA] Stream read returned 0. Network error.");
+            streamError = true;
+            break;
+        }
+
+        err = esp_ota_write(ota_handle, (const void*)buffer, bytesRead);
+        if (err != ESP_OK) {
+            Serial.printf("[OTA] esp_ota_write failed: %s\n", esp_err_to_name(err));
+            streamError = true;
+            break;
+        }
+    
+        mbedtls_sha256_update_ret(&sha_ctx, buffer, bytesRead);
+        bytesReceived += bytesRead;
+    
+        if (bytesReceived % 65536 == 0 || bytesReceived == totalBytes){
+            Serial.printf("[OTA] Progress: %d / %d bytes (%.1f%%)\n",
+                              bytesReceived, totalBytes,
+                              (float)bytesReceived / totalBytes * 100.0f);
+        }
+    }
+
+    http.end();
+
+    if (streamError){
+        esp_ota_abort(ota_handle);
+        Serial.println("[OTA] Aborted due to stream error");
+        mbedtls_sha256_free(&sha_ctx);
+        return false;
+    }
+
+    if (bytesReceived != totalBytes){
+        Serial.printf("[OTA] Size mismatch: got %d, expected %d. Aborting.\n",
+                      bytesReceived, totalBytes);
+        esp_ota_abort(ota_handle);
+        mbedtls_sha256_free(&sha_ctx);
+        return false;
+    }
+
+    uint8_t hash[32];
+    mbedtls_sha256_finish_ret(&sha_ctx, hash);
+    mbedtls_sha256_free(&sha_ctx);
+
+    String computedSHA = bytesToHex(hash, 32);
+    Serial.printf("[OTA] Computed SHA256:  %s\n", computedSHA.c_str());
+    Serial.printf("[OTA] Expected SHA256:  %s\n", headerSHA.c_str());
+
+    if (computedSHA != headerSHA || computedSHA != pendingFirmwareSHA) {
+        Serial.println("[OTA] ❌ SHA-256 MISMATCH. Firmware is corrupt or tampered.");
+        Serial.println("[OTA] Aborting — current firmware stays safe.");
+        esp_ota_abort(ota_handle);
+        return false;
+    }
+    Serial.println("[OTA] ✅ SHA-256 verified. Firmware is authentic.");
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        Serial.printf("[OTA] esp_ota_end failed: %s (bad binary header?)\n",
+                      esp_err_to_name(err));
+        return false;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        Serial.printf("[OTA] esp_ota_set_boot_partition failed: %s\n",
+                      esp_err_to_name(err));
+        return false;
+    }
+
+    Serial.println("[OTA] ✅ Boot partition updated. Ready to restart.");
     return true;
 }
 
-// ─── Step 3: Report OTA result back to server ─────────────────────────────────
-// POST /device/ota-status
-// Body: { device_id, status, new_version }
 
-void reportOTAStatus(bool success, const String& newVersion) {
-    Serial.println("\n[OTA] ── Step 3: Report OTA Status ──");
-
+// ─── Step 3: Report result ────────────────────────────────────────────────────
+void reportOTAStatus(bool success, const String& version) {
+    Serial.println("\n[OTA] --- Step 3: Reporting Status");
     String url = String(server_url) + "/device/ota-status";
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
 
     StaticJsonDocument<256> doc;
-    doc["device_id"]   = device_id;
-    doc["status"]      = success ? "success" : "failed";
-    doc["version"]     = newVersion;
+    doc["device_id"] = device_id;
+    doc["status"]    = success ? "success" : "failed";
+    doc["version"]   = version;
 
     String body;
     serializeJson(doc, body);
-
-    Serial.printf("[HTTP] POST %s\n", url.c_str());
-    Serial.printf("[HTTP] Body: %s\n", body.c_str());
-
-    int statusCode = http.POST(body);
-    Serial.printf("[HTTP] Response: %d\n", statusCode);
-    if (statusCode == 200) {
-        Serial.println("[OTA] Status reported successfully");
-    }
+    int code = http.POST(body);
+    Serial.printf("[OTA] Status report: HTTP %d\n", code);
     http.end();
 }
 
-// ─── Full OTA sequence ────────────────────────────────────────────────────────
 
+// ─── Full OTA sequence ────────────────────────────────────────────────────────
 void runOTAUpdate() {
     Serial.println("\n╔══════════════════════════════╗");
-    Serial.println("║      OTA UPDATE STARTED      ║");
+    Serial.println("║   PRODUCTION OTA STARTED     ║");
     Serial.println("╚══════════════════════════════╝");
+    Serial.printf("[HEAP] Free before OTA: %d bytes\n", ESP.getFreeHeap());
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[OTA] WiFi not connected, aborting");
-        return;
+        Serial.println("[OTA] WiFi not connected. Aborting."); return;
     }
 
     blinkLED(1, 500);
 
-    // Step 1: Check-in
-    bool updateNeeded = performChecking();
-    if (!updateNeeded) {
-        blinkLED(2, 200);
-        return;
+    if (!performCheckin()) {
+        blinkLED(2, 200); return;
     }
 
-    // Step 2: Download
-    bool downloaded = downlaod_the_firmware();
-    if (!downloaded) {
-        Serial.println("[OTA] Download failed");
-        reportOTAStatus(false, current_version);
+    bool success = download_and_flash_firmware();
+
+    reportOTAStatus(success, success ? pendingFirmwareSHA.substring(0, 8) : current_version);
+    // WHY substring(0,8)? Just a compact version tag for the status report.
+    // In production, the server embeds the version string IN the binary header
+    // and you'd extract it with esp_app_get_description() after boot.
+
+    if (success) {
+        Serial.println("\n[OTA] ✅ OTA Complete! Restarting in 3 seconds...");
+        blinkLED(10, 80);
+        delay(3000);
+
+        // WHY delay before restart?
+        //   Gives Serial output time to flush over USB.
+        //   Gives reportOTAStatus() HTTP response time to complete.
+        //   3 seconds is generous — 500ms would also work.
+        esp_restart();   // hardware reset — bootloader loads new firmware from OTA_1
+    } else {
+        Serial.println("[OTA] ❌ OTA Failed. Current firmware unchanged.");
         blinkLED(5, 100);
-        return;
     }
-
-    // Step 3: Report
-    // In real OTA, version comes from the downloaded binary header
-    // Here we hardcode the new version from the firmware_id
-    reportOTAStatus(true, "2.0.0");
-
-    Serial.println("\n[OTA] ✓ OTA Complete! In real system, esp_restart() would run here.");
-    blinkLED(10, 80);
 }
 
-// ─── Arduino entry points ────────────────────────────────────────────────────
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
     pinMode(LED_PIN, OUTPUT);
 
-    Serial.println("\n[BOOT] ESP32 OTA Demo Client");
-    Serial.printf("[BOOT] Device ID:      %s\n", device_id);
-    Serial.printf("[BOOT] Current Version: %s\n", current_version);
-    Serial.printf("[BOOT] Server:         %s\n", server_url);
+    Serial.println("\n[BOOT] ESP32 Production OTA Client v2");
+    Serial.printf("[BOOT] Device:  %s\n", device_id);
+    Serial.printf("[BOOT] Version: %s\n", current_version);
+    Serial.printf("[BOOT] Heap:    %d bytes free\n", ESP.getFreeHeap());
 
     connectwifi();
-
-    Serial.println("\n[READY] Type 'run' in Serial Monitor to trigger OTA check");
+    Serial.println("\n[READY] Commands: run | status | help");
 }
 
 void loop() {
-    // Wait for "run" command from Serial Monitor
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
@@ -250,15 +434,13 @@ void loop() {
         if (cmd == "run") {
             runOTAUpdate();
         } else if (cmd == "status") {
-            Serial.printf("[STATUS] Device: %s  Version: %s  WiFi: %s\n",
-                device_id,
-                current_version,
-                WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "DISCONNECTED"
-            );
+            Serial.printf("[STATUS] Device=%s  Version=%s  Heap=%d  WiFi=%s\n",
+                device_id, current_version, ESP.getFreeHeap(),
+                WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "DISCONNECTED");
         } else if (cmd == "help") {
-            Serial.println("[HELP] Commands: run | status | help");
+            Serial.println("[HELP] run | status | help");
         } else {
-            Serial.printf("[CMD] Unknown command: '%s'  (try 'help')\n", cmd.c_str());
+            Serial.printf("[CMD] Unknown: '%s'\n", cmd.c_str());
         }
     }
     delay(50);
